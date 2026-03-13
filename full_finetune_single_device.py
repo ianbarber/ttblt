@@ -143,6 +143,22 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         self._optimizer_in_bwd = cfg.optimizer_in_bwd
         self._clip_grad_norm = cfg.get("clip_grad_norm", None)
 
+        # Gradient spike detection: skip optimizer step if grad_norm > threshold * EMA
+        self._grad_spike_threshold = cfg.get("grad_spike_threshold", 10.0)
+        self._grad_norm_ema = None
+        self._grad_spike_count = 0
+
+        # Post-unfreeze LR re-warmup for Qwen params
+        self._unfreeze_warmup_steps = cfg.get("unfreeze_warmup_steps", 0)
+        self._unfreeze_step = None  # Set when global params unfreeze
+
+        # Intermediate checkpoint interval (in optimizer steps)
+        self._save_every_n_steps = cfg.get("save_every_n_steps", 1000)
+        self._eval_every_n_steps = cfg.get("eval_every_n_steps", self._save_every_n_steps)
+
+        # Warm-start: fast-forward global_step and LR scheduler
+        self._warm_start_step = cfg.get("warm_start_step", 0)
+
         # Optimizer in backward is not compatible with gradient accumulation or gradient clipping
         if self._optimizer_in_bwd:
             if self._clip_grad_norm is not None:
@@ -283,6 +299,24 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             compile_model=self._compile,
             model_state_dict=ckpt_dict[training.MODEL_KEY],
         )
+
+        # Optionally load a previously-saved intermediate checkpoint on top of the
+        # base model. This allows resuming from a Meta-format checkpoint (adapter_model.pt)
+        # without needing the full HF resume machinery.
+        warm_start_dir = cfg.get("warm_start_checkpoint_dir", None)
+        if warm_start_dir is not None:
+            import os, glob
+            warm_start_dir = os.path.expanduser(warm_start_dir)
+            ckpt_path = os.path.join(warm_start_dir, "adapter_model.pt")
+            log.info(f"Loading warm-start checkpoint from {ckpt_path}")
+            warm_state = torch.load(ckpt_path, weights_only=True, map_location=self._device)
+            missing, unexpected = self._model.load_state_dict(warm_state, strict=False)
+            if missing:
+                log.info(f"Warm-start missing keys: {len(missing)}")
+            if unexpected:
+                log.info(f"Warm-start unexpected keys: {len(unexpected)}")
+            log.info("Warm-start checkpoint loaded.")
+
         self._tokenizer = config.instantiate(cfg.tokenizer)
         log.info("Tokenizer is initialized from file.")
 
@@ -316,6 +350,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             shuffle=cfg.shuffle,
             batch_size=cfg.batch_size,
             collate_fn=collate_name,
+            patch_ids_dir=cfg.get("patch_ids_dir", None),
         )
 
         # Finally update the recipe state which can only be correctly set after all of the
@@ -335,12 +370,25 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             self._steps_per_epoch = self.max_steps_per_epoch
         self.global_step = self.epochs_run * self._steps_per_epoch
 
-        # Setup lr scheduler
+        # Setup lr scheduler (fast-forward if warm-starting)
+        last_epoch = max(self.global_step, self._warm_start_step) - 1
+        # PyTorch requires initial_lr in param groups when last_epoch >= 0
+        if last_epoch >= 0 and not self._optimizer_in_bwd:
+            for group in self._optimizer.param_groups:
+                group.setdefault("initial_lr", group["lr"])
         self._lr_scheduler = self._setup_lr_scheduler(
             cfg_lr_scheduler=cfg.get("lr_scheduler", None),
             num_training_steps=self.total_epochs * self._steps_per_epoch,
-            last_epoch=self.global_step - 1,
+            last_epoch=last_epoch,
         )
+
+        # Apply warm-start step offset after scheduler is initialized
+        if self._warm_start_step > 0:
+            self.global_step = self._warm_start_step
+            log.info(
+                f"Warm-start: global_step set to {self.global_step}, "
+                f"LR scheduler fast-forwarded (last_epoch={last_epoch})"
+            )
 
         # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
         # if cfg is missing profiler key or if `cfg.profiler.enabled = False`
@@ -523,8 +571,25 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             log.info("In-backward optimizers are set up.")
             return None
         else:
-            # TODO: doesn't support split learning rates!
-            optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
+            base_model_lr = cfg_optimizer.get("base_model_lr", None)
+            if base_model_lr is not None:
+                # Split learning rates: higher LR for new BLT params, lower for pretrained Qwen
+                cfg_opt_copy = cfg_optimizer.copy()
+                # Remove base_model_lr — not a real optimizer param
+                del cfg_opt_copy["base_model_lr"]
+                param_groups = [
+                    {"params": list(self._model.new_params), "lr": cfg_opt_copy.lr},
+                    {"params": list(self._model.qwen_params), "lr": base_model_lr},
+                ]
+                # Remove lr from cfg since it's in param groups
+                del cfg_opt_copy["lr"]
+                optimizer = config.instantiate(cfg_opt_copy, param_groups)
+                log.info(
+                    f"Split LR optimizer: new_params lr={cfg_optimizer.lr}, "
+                    f"qwen_params lr={base_model_lr}"
+                )
+            else:
+                optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
 
             if opt_state_dict:
                 optimizer.load_state_dict(opt_state_dict)
@@ -584,6 +649,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         shuffle: bool,
         batch_size: int,
         collate_fn: str,
+        patch_ids_dir: Optional[str] = None,
     ) -> Tuple[DistributedSampler, DataLoader]:
         """
         All data related setup happens here. Currently this recipe only supports the
@@ -605,6 +671,14 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         if "left_pad_sequence" in collate_fn:
             raise RuntimeError("left_pad_sequence collator is only for inference.")
         collate_fn = _get_component_from_path(collate_fn)
+
+        # Optionally wrap dataset with pre-computed entropy-based patch_ids
+        if patch_ids_dir is not None:
+            from ttblt.entropy_model import PatchIdStore, DatasetWithPatchIds, padded_collate_sft_with_patches
+            store = PatchIdStore(patch_ids_dir)
+            ds = DatasetWithPatchIds(ds, store)
+            collate_fn = padded_collate_sft_with_patches
+            log.info(f"Loaded pre-computed patch_ids from {patch_ids_dir} ({len(store)} examples)")
 
         sampler = DistributedSampler(
             ds,
@@ -662,6 +736,84 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             intermediate_checkpoint=(epoch + 1 < self.total_epochs),
             adapter_only=True
         )
+
+    _EVAL_PASSAGES = {
+        "photosynthesis": (
+            "Below is an instruction that describes a task. Write a response that "
+            "appropriately completes the request.\n\n### Instruction:\n"
+            "Explain how photosynthesis works in simple terms.\n\n### Response:\n\n"
+            "Photosynthesis is the process by which plants convert sunlight into energy. "
+            "Plants absorb light through chlorophyll in their leaves, which captures the "
+            "sun's energy. They then use this energy to convert carbon dioxide from the air "
+            "and water from the soil into glucose, a type of sugar that serves as food for "
+            "the plant. Oxygen is released as a byproduct of this process."
+        ),
+        "slimorca_math": (
+            "system\nYou are an AI assistant that helps people find information.\n"
+            "human\nWhat is the sum of the first 10 prime numbers?\n"
+            "assistant\nThe first 10 prime numbers are 2, 3, 5, 7, 11, 13, 17, 19, 23, and 29. "
+            "Their sum is 2 + 3 + 5 + 7 + 11 + 13 + 17 + 19 + 23 + 29 = 129."
+        ),
+        "slimorca_explain": (
+            "system\nYou are an AI assistant. Provide a detailed answer.\n"
+            "human\nExplain the difference between a stack and a queue in computer science.\n"
+            "assistant\nA stack and a queue are both abstract data types used to store "
+            "collections of elements, but they differ in how elements are added and removed. "
+            "A stack follows the Last-In-First-Out (LIFO) principle, meaning the most "
+            "recently added element is the first one to be removed. Think of a stack of "
+            "plates: you add plates to the top and remove them from the top. Common "
+            "operations are push (add to top) and pop (remove from top). A queue follows "
+            "the First-In-First-Out (FIFO) principle, meaning the first element added is "
+            "the first one removed. Think of a line at a store: the first person in line "
+            "is the first person served. Common operations are enqueue (add to back) and "
+            "dequeue (remove from front)."
+        ),
+        "history": (
+            "Below is an instruction that describes a task. Write a response that "
+            "appropriately completes the request.\n\n### Instruction:\n"
+            "Briefly describe the causes of World War I.\n\n### Response:\n\n"
+            "World War I was caused by a complex web of factors including rising "
+            "nationalism across Europe, imperial competition for colonies and resources, "
+            "a tangled system of military alliances, and an arms race between major powers. "
+            "The immediate trigger was the assassination of Archduke Franz Ferdinand of "
+            "Austria-Hungary in Sarajevo in June 1914. This set off a chain reaction as "
+            "alliance obligations drew one nation after another into the conflict."
+        ),
+        "factual_short": (
+            "system\nYou are a helpful assistant.\n"
+            "human\nWhat is the capital of France?\n"
+            "assistant\nThe capital of France is Paris."
+        ),
+    }
+
+    def _eval_bpb(self) -> Optional[float]:
+        """Diagnostic BPB averaged over multiple held-out passages. Returns bits-per-byte or None on error."""
+        try:
+            self._model.eval()
+            bpb_values = {}
+            with torch.no_grad():
+                for name, text in self._EVAL_PASSAGES.items():
+                    tokens = self._tokenizer.encode(text, add_bos=True, add_eos=True)
+                    input_ids = torch.tensor([tokens], dtype=torch.long, device=self._device)
+                    logits = self._model(input_ids[:, :-1])
+                    if isinstance(logits, list):
+                        logits = torch.cat(logits, dim=1)
+                    targets = input_ids[:, 1:]
+                    loss = torch.nn.functional.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        targets.reshape(-1),
+                        reduction="mean",
+                    )
+                    bpb_values[name] = loss.item() / 0.6931
+            self._model.train()
+            # Log individual passage BPBs and return average
+            avg_bpb = sum(bpb_values.values()) / len(bpb_values)
+            self._per_passage_bpb = bpb_values  # stash for caller to log
+            return avg_bpb
+        except Exception as e:
+            log.warning(f"Eval BPB failed: {e}")
+            self._model.train()
+            return None
 
     def _loss_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         # Shape [b, s], needed for the loss not the model
@@ -753,13 +905,59 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                                 self._model.parameters(),
                                 max_norm=float(self._clip_grad_norm),
                             )
-                        self._optimizer.step()
-                        self._optimizer.zero_grad(set_to_none=True)
+
+                        # Gradient spike detection: skip step if grad_norm is anomalous
+                        skip_step = False
+                        if self._clip_grad_norm is not None and self._grad_spike_threshold > 0:
+                            gn = grad_norm.item()
+                            if self._grad_norm_ema is None:
+                                self._grad_norm_ema = gn
+                            spike_ratio = gn / max(self._grad_norm_ema, 1e-7)
+                            if spike_ratio > self._grad_spike_threshold and self.global_step > 100:
+                                self._grad_spike_count += 1
+                                skip_step = True
+                                log.warning(
+                                    f"Step {self.global_step}: grad_norm spike "
+                                    f"({gn:.2f} vs EMA {self._grad_norm_ema:.4f}, "
+                                    f"ratio={spike_ratio:.1f}x). Skipping step. "
+                                    f"Total skipped: {self._grad_spike_count}"
+                                )
+                            else:
+                                self._grad_norm_ema = 0.99 * self._grad_norm_ema + 0.01 * gn
+
+                        if skip_step:
+                            self._optimizer.zero_grad(set_to_none=True)
+                        else:
+                            self._optimizer.step()
+                            self._optimizer.zero_grad(set_to_none=True)
 
                     # Need to fix `lr_scheduler.step()` before `optimizer.step()` warning
                     if self._lr_scheduler is not None:
                         self._lr_scheduler.step()
                     self.global_step += 1
+
+                    # Post-unfreeze LR re-warmup for Qwen params (param_group[1]).
+                    # After the cosine scheduler sets the LR, we scale the Qwen group's
+                    # LR by a linear warmup factor that goes from 0 → 1 over
+                    # unfreeze_warmup_steps after the global model unfreezes.
+                    if (
+                        self._unfreeze_warmup_steps > 0
+                        and not self._optimizer_in_bwd
+                        and len(self._optimizer.param_groups) > 1
+                    ):
+                        # Detect unfreeze event
+                        if self._unfreeze_step is None and not self._model.global_frozen:
+                            self._unfreeze_step = self.global_step
+                            log.info(
+                                f"Global model unfroze at step {self._unfreeze_step}, "
+                                f"re-warming Qwen LR over {self._unfreeze_warmup_steps} steps"
+                            )
+                        # Apply linear scaling during re-warmup
+                        if self._unfreeze_step is not None:
+                            steps_since_unfreeze = self.global_step - self._unfreeze_step
+                            if steps_since_unfreeze < self._unfreeze_warmup_steps:
+                                scale = steps_since_unfreeze / self._unfreeze_warmup_steps
+                                self._optimizer.param_groups[1]["lr"] *= scale
 
                     loss_to_log = running_loss.item() / num_tokens
                     pbar.update(1)
@@ -770,17 +968,21 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                     # Log per-step metrics
                     if self.global_step % self._log_every_n_steps == 0:
                         time_per_step = time.perf_counter() - t0
-                        log_dict = {
-                            "loss": loss_to_log,
-                            # NOTE: for optim in backward, this assumes all optimizers have the same LR. This is currently
-                            # true since we don't expose the ability to configure this yet.
-                            "lr": get_lr(
-                                (
+                        if not self._optimizer_in_bwd and len(self._optimizer.param_groups) > 1:
+                            lr_new = self._optimizer.param_groups[0]["lr"]
+                            lr_base = self._optimizer.param_groups[1]["lr"]
+                            lr_log = {"lr_new": lr_new, "lr_base": lr_base}
+                        else:
+                            lr_log = {
+                                "lr": get_lr(
                                     self._optimizer
                                     if not self._optimizer_in_bwd
                                     else self._optim_ckpt_wrapper
                                 ),
-                            ),
+                            }
+                        log_dict = {
+                            "loss": loss_to_log,
+                            **lr_log,
                             "tokens_per_second_per_gpu": num_tokens / time_per_step,
                         }
                         if self._device.type != "cpu" and self._log_peak_memory_stats:
@@ -816,9 +1018,24 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                 # if the schedule cycle doesn't align with gradient accumulation.
                 self._profiler.step()
 
-                # TODO: hack, take some intemediate checkpoints. 
-                if idx % 2000 == 0 and idx > 0:
-                    self.save_checkpoint(epoch=curr_epoch+(idx//2000))
+                # Save intermediate checkpoints at step-aligned intervals
+                if (idx + 1) % self._gradient_accumulation_steps == 0:
+                    if self.global_step > 0 and self.global_step % self._save_every_n_steps == 0:
+                        save_epoch = self.global_step // self._save_every_n_steps
+                        self.save_checkpoint(epoch=save_epoch)
+                        log.info(f"Checkpoint saved at step {self.global_step} (epoch_{save_epoch})")
+
+                    # Eval BPB independently of checkpointing
+                    if self.global_step > 0 and self.global_step % self._eval_every_n_steps == 0:
+                        bpb = self._eval_bpb()
+                        if bpb is not None:
+                            per_passage = getattr(self, '_per_passage_bpb', {})
+                            detail = ", ".join(f"{k}={v:.2f}" for k, v in per_passage.items())
+                            log.info(f"Step {self.global_step}: eval_bpb={bpb:.3f} ({detail})")
+                            log_dict = {"eval_bpb": bpb}
+                            for k, v in per_passage.items():
+                                log_dict[f"eval_bpb/{k}"] = v
+                            self._metric_logger.log_dict(log_dict, self.global_step)
 
             self.epochs_run += 1
             self.save_checkpoint(epoch=curr_epoch)

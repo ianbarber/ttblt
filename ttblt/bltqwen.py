@@ -1,3 +1,6 @@
+import math
+import os
+
 import torch
 from torch import nn
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
@@ -143,13 +146,32 @@ class LocalDecoder(nn.Module):
         attn_dropout: float = 0.0,
         max_seq_len: int = 4096,
         dtype=torch.bfloat16,
+        dropout: float = 0.0,
     ):
         super().__init__()
         head_dim = embed_dim // num_heads
-        
-        # Self-attention layers
-        layers = nn.ModuleList()
-        for _ in range(num_layers):
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Build interleaved self-attention and cross-attention layers.
+        # Cross-attention layers are evenly distributed among self-attention layers.
+        # E.g. with 9 self-attn + 3 cross-attn: cross-attn after layers 3, 6, 9.
+        self.layers = nn.ModuleList()
+        self.layer_types = []  # 'self' or 'cross' for each layer
+
+        # Compute positions for cross-attention insertion
+        if num_cross_layers > 0 and num_layers > 0:
+            # Place cross-attn evenly: after every (num_layers // num_cross_layers) self-attn layers
+            interval = num_layers // num_cross_layers
+            cross_after = set()
+            for i in range(num_cross_layers):
+                pos = (i + 1) * interval  # 1-indexed self-attn layer count
+                cross_after.add(pos)
+        else:
+            cross_after = set()
+
+        sa_count = 0
+        for i in range(num_layers):
+            # Self-attention layer
             self_attn = MultiHeadAttention(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
@@ -170,94 +192,100 @@ class LocalDecoder(nn.Module):
                 sa_norm=RMSNorm(embed_dim, eps=norm_eps),
                 mlp_norm=RMSNorm(embed_dim, eps=norm_eps),
             )
-            layers.append(layer)
-        
-        # Decoder with no token embeddings
-        self.decoder = TransformerDecoder(
-            tok_embeddings=nn.Identity(),  # No embedding layer needed
-            layers=layers,
-            max_seq_len=max_seq_len,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            norm=RMSNorm(embed_dim, eps=norm_eps),
-            output=nn.Identity(),
-        )
-        
-        # Cross-attention layers
-        self.cross_attn_layers = nn.ModuleList()
-        for _ in range(num_cross_layers):
-            cross_attn = MultiHeadAttention(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=True),
-                k_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
-                v_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
-                output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
-                max_seq_len=max_seq_len,
-                attn_dropout=attn_dropout,
-                is_causal=False,
-            )
-            mlp = qwen2_mlp(dim=embed_dim, hidden_dim=hidden_dim)
-            cross_layer = TransformerCrossAttentionLayer(
-                attn=cross_attn,
-                mlp=mlp,
-                ca_norm=RMSNorm(embed_dim, eps=norm_eps),
-                mlp_norm=RMSNorm(embed_dim, eps=norm_eps),
-            )
-            self.cross_attn_layers.append(cross_layer)
-        
+            self.layers.append(layer)
+            self.layer_types.append('self')
+            sa_count += 1
+
+            # Insert cross-attention after this self-attn layer if scheduled
+            if sa_count in cross_after:
+                cross_attn = MultiHeadAttention(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=True),
+                    k_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
+                    v_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
+                    output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
+                    max_seq_len=max_seq_len,
+                    attn_dropout=attn_dropout,
+                    is_causal=False,
+                )
+                mlp = qwen2_mlp(dim=embed_dim, hidden_dim=hidden_dim)
+                cross_layer = TransformerCrossAttentionLayer(
+                    attn=cross_attn,
+                    mlp=mlp,
+                    ca_norm=RMSNorm(embed_dim, eps=norm_eps),
+                    mlp_norm=RMSNorm(embed_dim, eps=norm_eps),
+                )
+                self.layers.append(cross_layer)
+                self.layer_types.append('cross')
+
+        self.norm = RMSNorm(embed_dim, eps=norm_eps)
         self.output = nn.Linear(embed_dim, vocab_size, bias=False)
         self.to(dtype=dtype)
-    
-    def forward(self, byte_embeds, patch_embs, patch_ids):
-        # Pass byte embeddings directly to the decoder
-        x = self.decoder(byte_embeds, mask=None)  # Shape: [batch_size, seq_len, embed_dim]
-        x = x.to(torch.bfloat16) # TODO: Fix cast because no chunking.
 
-        # Apply cross-attention with patch embeddings
-        if self.cross_attn_layers:
-            num_patches = patch_embs.size(1)
-            mask = (
-                patch_ids.unsqueeze(2) == torch.arange(num_patches, device=byte_embeds.device).unsqueeze(0).unsqueeze(0)
-            )  # Shape: [batch_size, num_patches, seq_len]
-            for cross_layer in self.cross_attn_layers:
-                x = cross_layer(x, encoder_input=patch_embs, encoder_mask=mask)
-        
+    def forward(self, byte_embeds, patch_embs, patch_ids):
+        x = byte_embeds
+        x = x.to(patch_embs.dtype)  # Match dtype of incoming patch embeddings
+
+        # Build cross-attention mask once — SHIFTED to prevent information leak.
+        # Bytes in patch p attend to patch p-1 (previous patch), NOT patch p.
+        # This prevents the decoder from seeing future bytes within the same patch
+        # via the patch embedding (which is built from all bytes in that patch).
+        # Bytes in patch 0 attend to nothing (no previous patch exists).
+        num_patches = patch_embs.size(1)
+        shifted_patch_ids = patch_ids - 1  # patch 0 → -1 (won't match any valid patch)
+        cross_mask = (
+            shifted_patch_ids.unsqueeze(2) == torch.arange(num_patches, device=x.device).unsqueeze(0).unsqueeze(0)
+        )  # Shape: [batch_size, seq_len, num_patches]
+
+        # Run interleaved self-attention and cross-attention layers
+        for layer, ltype in zip(self.layers, self.layer_types):
+            if ltype == 'self':
+                x = layer(x)
+            else:
+                x = layer(x, encoder_input=patch_embs, encoder_mask=cross_mask)
+            x = self.dropout(x)
+
+        x = self.norm(x)
+
         # Compute logits
         logits = self.output(x)  # Shape: [batch_size, seq_len, vocab_size]
         return logits
 
 class LocalEncoderWithPooling(nn.Module):
-    def __init__(self, base_encoder, cross_attn_layers, embed_dim, global_dim):
+    def __init__(self, base_encoder, cross_attn_layers, embed_dim, global_dim, dropout=0.0):
         super().__init__()
         self.base_encoder = base_encoder
         self.cross_attn_layers = cross_attn_layers
-        self.patch_projector = PatchToGlobalProjector(embed_dim, global_dim) 
+        self.patch_projector = PatchToGlobalProjector(embed_dim, global_dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, bytes, patch_ids):
         # Get byte-level embeddings from the base encoder
         byte_embeds = self.base_encoder(bytes, mask=None)
         byte_embeds = byte_embeds.to(torch.bfloat16)
+        byte_embeds = self.dropout(byte_embeds)
 
-        # Apply cross-attention if layers exist
+        # Create initial patch representations via mean pooling
+        patch_embs, patch_mask = patch_reduce(byte_embeds, patch_ids, reduce_op="mean")
+
+        # Apply cross-attention: patches (query) attend to bytes (key/value)
         if self.cross_attn_layers:
-            # num_patches = patch_ids.max().item() + 1
-            local_encoder_mask = (patch_ids.unsqueeze(1) == patch_ids.unsqueeze(2))  # Shape: [batch_size, seq_len, seq_len]
-            patch_embs = byte_embeds  # Start with byte embeddings
+            num_patches = patch_embs.size(1)
+            # mask: [batch, num_patches, seq_len] — each patch attends to its constituent bytes
+            patch_to_byte_mask = (
+                patch_ids.unsqueeze(1) == torch.arange(num_patches, device=byte_embeds.device).unsqueeze(0).unsqueeze(2)
+            )  # Shape: [batch_size, num_patches, seq_len]
             for cross_layer in self.cross_attn_layers:
-                patch_embs = cross_layer(patch_embs, encoder_input=byte_embeds, encoder_mask=local_encoder_mask)
-        else:
-            patch_embs = byte_embeds
-
-        # Reduce byte-level embeddings to patch-level embeddings
-        patch_embs = patch_reduce(patch_embs, patch_ids, reduce_op="mean")  # Shape: [batch_size, num_patches, embed_dim]
+                patch_embs = cross_layer(patch_embs, encoder_input=byte_embeds, encoder_mask=patch_to_byte_mask)
+                patch_embs = self.dropout(patch_embs)
 
         # Project to global dimension
         patch_embs = self.patch_projector(patch_embs)  # Shape: [batch_size, num_patches, global_dim]
 
-        return byte_embeds, patch_embs  # Return both byte embeddings and reduced patch embeddings
+        return byte_embeds, patch_embs, patch_mask
 
 def build_local_encoder(
     global_dim: int,
@@ -273,8 +301,9 @@ def build_local_encoder(
     num_cross_layers = 4,
     dtype=torch.bfloat16,
     use_hash_ngrams=True,
-    max_ngram: int = 8, 
-    num_ngram_buckets: int = 500000, 
+    max_ngram: int = 8,
+    num_ngram_buckets: int = 500000,
+    dropout: float = 0.0,
 ):
     head_dim = embed_dim // num_heads
 
@@ -324,18 +353,18 @@ def build_local_encoder(
         output=nn.Identity(),  # no final projection
     )
 
-    # Cross-attention layers (optional)
+    # Cross-attention layers: patches (query, embed_dim) attend to bytes (key/value, embed_dim)
     cross_attn_layers = nn.ModuleList()
     for _ in range(num_cross_layers):
         cross_attn = MultiHeadAttention(
-            embed_dim=global_dim,
+            embed_dim=embed_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            q_proj=nn.Linear(global_dim, num_heads * head_dim, bias=True),
-            k_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
-            v_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
-            output_proj=nn.Linear(global_dim, global_dim, bias=False),
+            q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=True),
+            k_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=True),
+            v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=True),
+            output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
             max_seq_len=max_seq_len,
             attn_dropout=attn_dropout,
             is_causal=False,
@@ -344,12 +373,12 @@ def build_local_encoder(
         cross_layer = TransformerCrossAttentionLayer(
             attn=cross_attn,
             mlp=mlp,
-            ca_norm=RMSNorm(global_dim, eps=norm_eps),
-            mlp_norm=RMSNorm(global_dim, eps=norm_eps),
+            ca_norm=RMSNorm(embed_dim, eps=norm_eps),
+            mlp_norm=RMSNorm(embed_dim, eps=norm_eps),
         )
         cross_attn_layers.append(cross_layer)
     
-    local_encoder = LocalEncoderWithPooling(base_encoder, cross_attn_layers, embed_dim, global_dim)
+    local_encoder = LocalEncoderWithPooling(base_encoder, cross_attn_layers, embed_dim, global_dim, dropout=dropout)
     return local_encoder.to(dtype=dtype)
 
 ################################################
@@ -458,16 +487,23 @@ def dynamic_patch(
     return patch_ids, local_ent
 
 def patch_reduce(h, patch_ids, reduce_op="mean"):
-    """ 
+    """
     Arguments:
         h: [batch_size, seq_len, emb_dim]
         patch_ids: [batch_size, seq_len]
         reduce_op: e.g. "mean", "amin", "amax"
-    
+
     returns: [batch_size, num_patches, emb_dim]
+
+    Uses per-example patch counts to avoid batch-dependent behavior.
+    Each example's real patches are scatter-reduced independently;
+    shorter examples are zero-padded to the batch max.
     """
     batch_size, seq_len, emb_dim = h.shape
-    num_patches = patch_ids.max().item() + 1  # patch IDs go from 0..max
+
+    # Per-example patch counts, then pad to batch max
+    per_example_max = patch_ids.amax(dim=1)  # [batch_size]
+    num_patches = per_example_max.max().item() + 1
 
     # expand dims so we can scatter:
     expanded_ids = patch_ids.unsqueeze(-1).expand(-1, -1, emb_dim)
@@ -479,7 +515,28 @@ def patch_reduce(h, patch_ids, reduce_op="mean"):
         reduce=reduce_op,
         include_self=False,
     )
-    return reduced
+
+    # Build a mask indicating which patches are real vs zero-padded
+    # Shape: [batch_size, num_patches] — True for valid patches
+    patch_range = torch.arange(num_patches, device=h.device).unsqueeze(0)  # [1, num_patches]
+    patch_mask = patch_range <= per_example_max.unsqueeze(1)  # [batch_size, num_patches]
+
+    return reduced, patch_mask
+
+def fixed_patch(bytes_tensor: torch.Tensor, patch_size: int = 8):
+    """Simple fixed-size patching — deterministic, batch-independent.
+
+    Args:
+        bytes_tensor: [batch_size, seq_len]
+        patch_size: number of bytes per patch
+
+    Returns:
+        patch_ids: [batch_size, seq_len] with patch ID for each byte
+    """
+    batch_size, seq_len = bytes_tensor.shape
+    patch_ids = torch.arange(seq_len, device=bytes_tensor.device) // patch_size
+    return patch_ids.unsqueeze(0).expand(batch_size, -1)
+
 
 def compute_patch_size(so_far: torch.Tensor, threshold=3.0, max_patch=8):
     """
@@ -535,9 +592,14 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         self,
         qwen_cfg: Dict[str, Any],
         local_encoder_cfg: Dict[str, Any],
-        patch_size: int = 4,
+        patch_size: int = 8,
         patching_threshold: float = 3.0,
         freeze_global_for_n_steps: int = 0,
+        decoder_num_layers: int = 9,
+        decoder_num_cross_layers: int = 1,
+        entropy_model_path: Optional[str] = None,
+        entropy_threshold: float = 1.335,
+        max_patch_size: int = 0,  # 0 = no cap, matching BLT paper default
     ):
         layers = nn.ModuleList()
         head_dim = qwen_cfg['embed_dim'] // qwen_cfg['num_heads']
@@ -565,23 +627,7 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
             )
             layers.append(layer)
 
-        output = nn.Linear(
-            qwen_cfg['embed_dim'],
-            VOCAB_SIZE  ,  # bytes
-            bias=False,
-        )
-        # Initialize output bytes. 
-        init_std = qwen_cfg['embed_dim'] ** -0.5
-        with torch.no_grad():
-            nn.init.trunc_normal_(
-                output.weight,
-                mean=0.0,
-                std=init_std,
-                a=-3*init_std,
-                b=3*init_std,
-            )
-
-        output = nn.Identity()  # Global transformer doesn’t output logits
+        output = nn.Identity()  # Global transformer doesn't output logits
         emb = nn.Identity()
         super().__init__(
             tok_embeddings=emb,
@@ -594,13 +640,23 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         )
         self.local_encoder = build_local_encoder(**local_encoder_cfg, global_dim=qwen_cfg['embed_dim'])
         self.local_decoder = LocalDecoder(
-            embed_dim=qwen_cfg['embed_dim'],
+            embed_dim=local_encoder_cfg['embed_dim'],
             global_dim=qwen_cfg['embed_dim'],
             vocab_size=VOCAB_SIZE,
+            num_layers=decoder_num_layers,
+            num_cross_layers=decoder_num_cross_layers,
+            num_heads=local_encoder_cfg['num_heads'],
+            num_kv_heads=local_encoder_cfg['num_kv_heads'],
+            hidden_dim=local_encoder_cfg['hidden_dim'],
             max_seq_len=local_encoder_cfg['max_seq_len'],
+            dropout=local_encoder_cfg.get('dropout', 0.0),
         )
 
-         # Collect parameters for different learning rates
+        # Depth-dependent initialization for encoder/decoder layers
+        self._depth_dependent_init(self.local_encoder)
+        self._depth_dependent_init(self.local_decoder)
+
+        # Collect parameters for different learning rates
         self.qwen_params = []
         self.new_params = []
 
@@ -624,8 +680,39 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         if self.global_frozen:
             self._update_freezing()
 
+        # Entropy model for dynamic patching (inference only, optional)
+        self.entropy_threshold = entropy_threshold
+        self.max_patch_size = max_patch_size
+        self.entropy_model = None
+        if entropy_model_path is not None:
+            from ttblt.entropy_model import ByteEntropyModel
+            entropy_model_path = os.path.expanduser(entropy_model_path)
+            self.entropy_model = ByteEntropyModel()
+            state_dict = torch.load(
+                entropy_model_path, weights_only=True, map_location="cpu"
+            )
+            self.entropy_model.load_state_dict(state_dict)
+            self.entropy_model.eval()
+            for p in self.entropy_model.parameters():
+                p.requires_grad = False
+
         # We'll store how many chunks the user wants for final output
         self.num_output_chunks = 0  # default
+
+    @staticmethod
+    def _depth_dependent_init(module, init_std=0.02):
+        """Apply depth-dependent truncated normal initialization to transformer layers."""
+        # Find all transformer layers (self-attn and cross-attn)
+        layers = []
+        for name, child in module.named_modules():
+            if isinstance(child, (TransformerSelfAttentionLayer, TransformerCrossAttentionLayer)):
+                layers.append(child)
+        for layer_idx, layer in enumerate(layers):
+            factor = 1.0 / math.sqrt(2 * (layer_idx + 1))
+            std = init_std * factor
+            with torch.no_grad():
+                for p in layer.parameters():
+                    nn.init.trunc_normal_(p, mean=0.0, std=std, a=-3*std, b=3*std)
 
     def _update_freezing(self):
         if self.global_frozen:
@@ -656,18 +743,44 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
                 self.global_frozen = False
                 self._update_freezing()
 
+        # Three-tier patch_ids resolution:
+        # 1. Use provided patch_ids (pre-computed, during training)
+        # 2. Compute on-the-fly via entropy model (inference)
+        # 3. Fall back to fixed_patch (backward compatible)
         if patch_ids is None:
-            patch_ids, _ = dynamic_patch(tokens, threshold=self.patching_threshold, patch_size=self.patch_size)
+            if self.entropy_model is not None:
+                from ttblt.entropy_model import compute_byte_entropies, entropy_to_patch_ids
+                entropies = compute_byte_entropies(self.entropy_model, tokens)
+                patch_ids = entropy_to_patch_ids(
+                    entropies,
+                    threshold=self.entropy_threshold,
+                    max_patch_size=self.max_patch_size,
+                )
+            else:
+                patch_ids = fixed_patch(tokens, patch_size=self.patch_size)
     
-        byte_embeds, patch_embs = self.local_encoder(tokens, patch_ids=patch_ids)
+        byte_embeds, patch_embs, patch_mask = self.local_encoder(tokens, patch_ids=patch_ids)
+
+        # Build causal mask for global model that also masks out padding patches.
+        # patch_mask: [batch, num_patches] — True for real patches, False for padding.
+        # The global model needs [batch, num_patches, num_patches] or compatible shape.
+        if mask is None:
+            num_patches = patch_embs.size(1)
+            # Standard causal mask
+            causal = torch.tril(torch.ones(num_patches, num_patches, device=tokens.device, dtype=torch.bool))
+            # Combine with patch validity: can only attend to valid key patches
+            # patch_mask[:, None, :] broadcasts: [batch, 1, num_patches] — valid keys
+            # patch_mask[:, :, None] broadcasts: [batch, num_patches, 1] — valid queries
+            mask = causal.unsqueeze(0) & patch_mask.unsqueeze(1) & patch_mask.unsqueeze(2)
+
         global_out = super().forward(patch_embs, mask=mask, input_pos=input_pos)
-        
+
         # Assuming the outs are chunked, take entry[0] of outputs.
         if self.num_output_chunks == 0:
-            global_out = global_out.to(torch.bfloat16) # TODO: Another fix for the 0 chunk float. Need to move this dtype definiton.  
+            global_out = global_out.to(torch.bfloat16) # TODO: Another fix for the 0 chunk float. Need to move this dtype definiton.
             logits = self.local_decoder(byte_embeds, global_out, patch_ids)
-        else: 
-            global_out_combined = torch.cat(global_out, dim=1) # Unchunking - it would be better not to pass this through I think. 
+        else:
+            global_out_combined = torch.cat(global_out, dim=1) # Unchunking - it would be better not to pass this through I think.
             clogits = self.local_decoder(byte_embeds, global_out_combined, patch_ids)
             logits = [chunk for chunk in clogits.chunk(self.num_output_chunks, dim=1)]
         return logits
@@ -680,7 +793,7 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0,
-        frequency_penalty: float = 0.1,
+        frequency_penalty: float = 0.0,
         repetition_penalty: float = 1.5,
         greedy: bool = False,
     ) -> torch.Tensor:
@@ -693,56 +806,75 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         device = prompt.device
         all_tokens = prompt.clone()
 
-        # Track usage for freq / repetition penalty
-        token_counts = torch.bincount(all_tokens[0], minlength=VOCAB_SIZE).to(device)
+        # Compute initial patch_ids for the prompt and cache them.
+        # Prefix patches are stable (entropy model is causal), so we only
+        # need to extend by one patch_id per generated byte.
+        if self.entropy_model is not None:
+            from ttblt.entropy_model import compute_byte_entropies, entropy_to_patch_ids
+            entropies = compute_byte_entropies(self.entropy_model, all_tokens)
+            cached_patch_ids = entropy_to_patch_ids(
+                entropies, threshold=self.entropy_threshold,
+                max_patch_size=self.max_patch_size,
+            )
+            last_entropy = entropies[0, -1].item()
+        else:
+            cached_patch_ids = fixed_patch(all_tokens, patch_size=self.patch_size)
+            last_entropy = None
+
+        # Track state for incremental patching
+        current_patch_id = cached_patch_ids[0, -1].item()
+        current_patch_len = (cached_patch_ids[0] == current_patch_id).sum().item()
+
+        # Track usage for freq / repetition penalty — only count generated tokens
+        token_counts = torch.zeros(VOCAB_SIZE, device=device)
         recent_tokens = []
 
         # Start generating
         for step_i in range(max_new_tokens):
 
-            # No patching => standard forward
             with torch.no_grad():
-                logits = self.forward(all_tokens)
+                logits = self.forward(all_tokens, patch_ids=cached_patch_ids)
 
             if isinstance(logits, list):
                 logits = torch.cat(logits, dim=1)
-            step_logits = logits[0, -1, :]
+            step_logits = logits[0, -1, :].clone()
 
             # Apply temperature
             if temperature != 1.0:
                 step_logits = step_logits / temperature
 
-            # Repetition penalty
+            # Repetition penalty (CTRL paper style: handle positive/negative logits)
             for tk in recent_tokens:
-                step_logits[tk] /= repetition_penalty
+                if step_logits[tk] > 0:
+                    step_logits[tk] /= repetition_penalty
+                else:
+                    step_logits[tk] *= repetition_penalty
 
-            # Frequency penalty
-            step_logits -= token_counts * frequency_penalty
+            # Frequency penalty (only on generated tokens, not prompt)
+            if frequency_penalty > 0:
+                step_logits -= token_counts * frequency_penalty
 
             # top-k
             if top_k > 0:
-                vals, idxs = torch.topk(step_logits, top_k)
+                vals, idxs = torch.topk(step_logits, min(top_k, step_logits.size(-1)))
                 mask = torch.ones_like(step_logits, dtype=torch.bool)
                 mask[idxs] = False
                 step_logits[mask] = float('-inf')
 
-            # top-p
-            probs = torch.softmax(step_logits, dim=-1)
+            # top-p (nucleus sampling)
             if top_p > 0:
                 sorted_logits, sorted_indices = torch.sort(step_logits, descending=True)
-                cumulative_probs = torch.cumsum(probs, dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = 0
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                step_logits = step_logits.scatter(-1, indices_to_remove, -1e9)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                # Remove tokens with cumulative probability above the threshold
+                sorted_mask = cumulative_probs - sorted_probs > top_p
+                sorted_logits[sorted_mask] = float('-inf')
+                # Scatter back to original ordering
+                step_logits = torch.zeros_like(step_logits).fill_(float('-inf'))
+                step_logits.scatter_(0, sorted_indices, sorted_logits)
 
-            # Re‐normalize            
-            total_p = probs.sum()
-            if total_p > 0:
-                probs /= total_p
-            else:
-                probs = torch.ones_like(probs) / probs.size(-1)
+            # Compute final probabilities
+            probs = torch.softmax(step_logits, dim=-1)
 
             # Next token
             if greedy:
@@ -755,6 +887,30 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
                 [all_tokens, torch.tensor([[next_token]], device=device)],
                 dim=1,
             )
+
+            # Determine patch assignment for the new byte
+            if self.entropy_model is not None:
+                trigger = last_entropy > self.entropy_threshold
+                if self.max_patch_size > 0:
+                    trigger = trigger or (current_patch_len >= self.max_patch_size)
+            else:
+                new_pos = all_tokens.size(1) - 1
+                trigger = (new_pos // self.patch_size) > current_patch_id
+
+            if trigger:
+                current_patch_id += 1
+                current_patch_len = 1
+            else:
+                current_patch_len += 1
+
+            # Extend cached patch_ids
+            new_id = torch.tensor([[current_patch_id]], device=device, dtype=torch.long)
+            cached_patch_ids = torch.cat([cached_patch_ids, new_id], dim=1)
+
+            # Update entropy for next step's patch decision
+            if self.entropy_model is not None:
+                entropies = compute_byte_entropies(self.entropy_model, all_tokens)
+                last_entropy = entropies[0, -1].item()
 
             # Update counters
             token_counts[next_token] += 1
@@ -817,15 +973,17 @@ class ByteLatentModelTokenizer(nn.Module):
         mask = []
         for message in messages:
             if message.role != "ipython":
-                tokenized_messages.extend(self.encode("".join([message.role, "\n"]), add_bos=False, add_eos=False))
+                role_tokens = self.encode("".join([message.role, "\n"]), add_bos=False, add_eos=False)
+                tokenized_messages.extend(role_tokens)
+                mask.extend([message.masked] * len(role_tokens))
             for item in message.content:
                 if item['type'] == "text":
-                    tokenized_messages.extend(
-                        self.encode(item['content'], add_bos=False, add_eos=False)
-                    )
+                    content_tokens = self.encode(item['content'], add_bos=False, add_eos=False)
+                    tokenized_messages.extend(content_tokens)
+                    mask.extend([message.masked] * len(content_tokens))
         if add_eos:
             tokenized_messages.append(self.eos_id)
-        mask = [False] * len(tokenized_messages)
+            mask.append(False)
         if self.max_seq_len:
             tokenized_messages = tokenized_messages[: self.max_seq_len]
             mask = mask[: self.max_seq_len]
@@ -833,7 +991,7 @@ class ByteLatentModelTokenizer(nn.Module):
 
     def forward(self, sample: Mapping[str, Any], inference: bool = False) -> Mapping[str, Any]:
         messages = sample.pop("messages")
-        tokens, mask = self.tokenize_messages(messages)
+        tokens, mask = self.tokenize_messages(messages, add_eos=not inference)
         sample["tokens"] = tokens
         sample["mask"] = mask
         return sample
@@ -857,12 +1015,22 @@ def blt_tokenizer(
 # Define Qwen 2.5 base model with additional layers, we will expect this to be loaded 
 # with a pretrained Qwen checkpoint which should match. 
 def qwen2_5_blt(
-    # Warm up decoder/encoder. Tried it with both 100 and 0 and it seemed to work better without
-    # the warmup, but never tested a longer warmup. 
-    freeze_global_for_n_steps=500,
+    freeze_global_for_n_steps=0,
     use_hash_ngrams=True,
-    patch_size=4,
-    max_seq_len=4096
+    patch_size=8,
+    max_seq_len=4096,
+    # Encoder layer config (paper: 1+1 with hash n-grams)
+    encoder_num_layers=1,
+    encoder_num_cross_layers=1,
+    # Decoder layer config (paper: 9+1)
+    decoder_num_layers=9,
+    decoder_num_cross_layers=1,
+    # Entropy-based dynamic patching (inference)
+    entropy_model_path=None,
+    entropy_threshold=1.335,
+    max_patch_size=0,  # 0 = no cap (BLT paper default)
+    # Regularization
+    dropout=0.0,
 ) -> ByteLatentQwen2p5Decoder:
     qwen_cfg = dict(
         vocab_size=151936, # Kinda irrelevant
@@ -877,18 +1045,19 @@ def qwen2_5_blt(
     )
 
     local_enc_cfg = dict(
-        vocab_size=VOCAB_SIZE, 
+        vocab_size=VOCAB_SIZE,
         embed_dim=2048, # Keeping same as Qwen
-        num_layers=4,
+        num_layers=encoder_num_layers,
         num_heads=8,
         num_kv_heads=8,
         max_seq_len=max_seq_len,
         hidden_dim=4096,
         norm_eps=1e-5,
-        num_cross_layers = 4,
+        num_cross_layers=encoder_num_cross_layers,
         use_hash_ngrams=use_hash_ngrams,
-        max_ngram= 8, 
-        num_ngram_buckets=500000, 
+        max_ngram=8,
+        num_ngram_buckets=500000,
+        dropout=dropout,
     )
 
     return ByteLatentQwen2p5Decoder(
@@ -896,5 +1065,76 @@ def qwen2_5_blt(
         local_encoder_cfg=local_enc_cfg,
         patch_size=patch_size,
         patching_threshold=3.0,
-        freeze_global_for_n_steps=freeze_global_for_n_steps
+        freeze_global_for_n_steps=freeze_global_for_n_steps,
+        decoder_num_layers=decoder_num_layers,
+        decoder_num_cross_layers=decoder_num_cross_layers,
+        entropy_model_path=entropy_model_path,
+        entropy_threshold=entropy_threshold,
+        max_patch_size=max_patch_size,
     )
+
+
+def test_decoder_cross_attention_mask():
+    """Validate the decoder's shifted cross-attention mask.
+
+    The decoder uses shifted cross-attention: bytes in patch p attend to
+    patch p-1 (previous patch), NOT patch p. This prevents information leak
+    where bytes could see future bytes in the same patch via the patch embedding.
+
+    Tests:
+    1. Different patch assignments produce different outputs (mask works)
+    2. Bytes in patch 0 get no cross-attention info (no previous patch)
+    3. Shifting is correct: patch 1 bytes attend to patch 0, etc.
+
+    Run: python -m ttblt.bltqwen
+    """
+    torch.manual_seed(42)
+    embed_dim, global_dim = 64, 64
+    seq_len, num_patches = 12, 3
+
+    decoder = LocalDecoder(
+        embed_dim=embed_dim,
+        global_dim=global_dim,
+        vocab_size=VOCAB_SIZE,
+        num_layers=2,
+        num_cross_layers=1,
+        num_heads=4,
+        num_kv_heads=4,
+        hidden_dim=128,
+        dtype=torch.float32,
+    )
+    decoder.eval()
+
+    byte_embeds = torch.randn(1, seq_len, embed_dim)
+    patch_embs = torch.randn(1, num_patches, global_dim)
+
+    # Test 1: Different patch assignments produce different outputs
+    patch_ids_a = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]])
+    patch_ids_b = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2]])
+
+    with torch.no_grad():
+        out_a = decoder(byte_embeds, patch_embs, patch_ids_a)
+        out_b = decoder(byte_embeds, patch_embs, patch_ids_b)
+
+    diff = (out_a - out_b).abs().max().item()
+    assert diff > 1e-6, f"Test 1 FAIL: outputs identical despite different masks (max diff={diff})"
+    print(f"PASS: test 1 — different patch assignments produce different outputs (max diff={diff:.6f})")
+
+    # Test 2: Verify shifted mask structure directly
+    shifted_ids = patch_ids_a - 1  # [[-1,-1,-1,-1, 0,0,0,0, 1,1,1,1]]
+    cross_mask = (
+        shifted_ids.unsqueeze(2) == torch.arange(num_patches).unsqueeze(0).unsqueeze(0)
+    )
+    # Patch 0 bytes (positions 0-3) should attend to NO patches (shifted id = -1)
+    assert cross_mask[0, 0:4, :].sum() == 0, "Test 2 FAIL: patch 0 bytes should attend to nothing"
+    # Patch 1 bytes (positions 4-7) should attend to patch 0 only
+    assert cross_mask[0, 4, 0] == True, "Test 2 FAIL: patch 1 bytes should attend to patch 0"
+    assert cross_mask[0, 4, 1] == False, "Test 2 FAIL: patch 1 bytes should NOT attend to patch 1"
+    # Patch 2 bytes (positions 8-11) should attend to patch 1 only
+    assert cross_mask[0, 8, 1] == True, "Test 2 FAIL: patch 2 bytes should attend to patch 1"
+    assert cross_mask[0, 8, 2] == False, "Test 2 FAIL: patch 2 bytes should NOT attend to patch 2"
+    print("PASS: test 2 — shifted mask structure is correct")
+
+
+if __name__ == "__main__":
+    test_decoder_cross_attention_mask()

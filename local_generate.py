@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import itertools
+import math
 import sys
 import time
 from typing import Any, Dict, List
@@ -90,7 +91,12 @@ class InferenceRecipe:
                 model_state_dict[k] = v.to(self._device)
             model.load_state_dict(model_state_dict, assign=True)
         else:
-            model.load_state_dict(model_state_dict)
+            # strict=False: entropy model keys may be missing from checkpoint
+            result = model.load_state_dict(model_state_dict, strict=False)
+            if result.missing_keys:
+                logger.info(f"Missing keys in checkpoint (expected for entropy model): {len(result.missing_keys)} keys")
+            if result.unexpected_keys:
+                logger.warning(f"Unexpected keys in checkpoint: {result.unexpected_keys}")
 
         # Validate model was loaded in with the expected dtype.
         training.validate_expected_param_dtype(
@@ -121,7 +127,39 @@ class InferenceRecipe:
         return self._tokenizer({"messages": messages}, inference=True)["tokens"]
 
     @torch.inference_mode()
+    def diagnostic_loss(self):
+        """Run a forward pass on a training-format prompt and print cross-entropy loss.
+        Uses the same tokenization path as training (role-prefixed messages, no BOS)."""
+        from torchtune.data import Message
+        messages = [
+            Message(role="user", content=(
+                "Below is an instruction that describes a task. "
+                "Write a response that appropriately completes the request.\n\n"
+                "### Instruction:\nWhat is the capital of France?\n\n"
+                "### Response:\n"
+            ), eot=True),
+            Message(role="assistant", content="The capital of France is Paris."),
+        ]
+        result = self._tokenizer({"messages": messages}, inference=False)
+        diag_tokens = result["tokens"]
+        diag_input = torch.tensor([diag_tokens], dtype=torch.long, device=self._device)
+
+        logits = self._model(diag_input[:, :-1])
+        targets = diag_input[:, 1:]
+        if isinstance(logits, list):
+            logits = torch.cat(logits, dim=1)
+        loss = nn.CrossEntropyLoss()(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        bpb = loss.item() / math.log(2)  # convert nats to bits-per-byte
+        logger.info(f"Diagnostic loss (training format): {loss.item():.4f} nats, {bpb:.4f} bits-per-byte")
+        return loss.item()
+
+    @torch.inference_mode()
     def generate(self, cfg: DictConfig):
+        self._model.eval()
+
+        # Run diagnostic forward pass first
+        self.diagnostic_loss()
+
         tokens = self.convert_prompt_to_tokens(
             cfg.prompt,
         )
@@ -136,43 +174,45 @@ class InferenceRecipe:
                     dtype=self._dtype,
                     decoder_max_seq_len=prompt.numel() + cfg.max_new_tokens,
                 )
-        # Use patch based model decoding. 
+        # Use patch based model decoding.
         t0 = time.perf_counter()
         prompt = torch.tensor(tokens, dtype=torch.long, device=self._device) # Changed to long.
 
-        generated_tokens = self._model.unified_generate(prompt, greedy=True, max_new_tokens=20)  
+        max_new = cfg.max_new_tokens
+
+        generated_tokens = self._model.unified_generate(prompt, greedy=True, max_new_tokens=max_new)
         decoded = self._tokenizer.decode(generated_tokens[0])
         print("Generated text (greedy):", decoded)
 
-        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=20)  
+        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=max_new)
         decoded = self._tokenizer.decode(generated_tokens[0])
         print("Generated text (sampling):", decoded)
 
-        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=20, top_k=150)  
+        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=max_new, top_k=150)
         decoded = self._tokenizer.decode(generated_tokens[0])
         print("Generated text (sampling, tk150):", decoded)
 
-        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=20, top_k=50)  
+        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=max_new, top_k=50)
         decoded = self._tokenizer.decode(generated_tokens[0])
         print("Generated text (sampling, tk50):", decoded)
 
-        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=20, top_k=50, temperature=1.0)  
+        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=max_new, top_k=50, temperature=1.0)
         decoded = self._tokenizer.decode(generated_tokens[0])
         print("Generated text (sampling, tk50, t1):", decoded)
 
-        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=20, top_k=50, temperature=0.6)  
+        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=max_new, top_k=50, temperature=0.6)
         decoded = self._tokenizer.decode(generated_tokens[0])
         print("Generated text (sampling, tk50, t0.6):", decoded)
 
-        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=20, top_k=50, temperature=0.3)  
+        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=max_new, top_k=50, temperature=0.3)
         decoded = self._tokenizer.decode(generated_tokens[0])
         print("Generated text (sampling, tk50, t0.3):", decoded)
 
-        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=20, top_k=50, temperature=0.3, repetition_penalty=1.0)  
+        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=max_new, top_k=50, temperature=0.3, repetition_penalty=1.0)
         decoded = self._tokenizer.decode(generated_tokens[0])
         print("Generated text (sampling, tk50, t0.3, rep1):", decoded)
 
-        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=20, top_k=50, temperature=0.3, repetition_penalty=0.6)  
+        generated_tokens = self._model.unified_generate(prompt, greedy=False, max_new_tokens=max_new, top_k=50, temperature=0.3, repetition_penalty=0.6)
         decoded = self._tokenizer.decode(generated_tokens[0])
         print("Generated text (sampling, tk50, t0.3, rep0.6):", decoded)
 

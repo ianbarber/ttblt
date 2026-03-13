@@ -13,14 +13,21 @@ output_dir: /tmp/torchtune/qwen2_5_3B_blt/generate
 # Model arguments
 model:
   _component_: ttblt.bltqwen.qwen2_5_blt
-  use_hash_ngrams: 0
-  patch_size: 4
+  use_hash_ngrams: 1
+  patch_size: 8
+  encoder_num_layers: 3
+  encoder_num_cross_layers: 1
+  decoder_num_layers: 9
+  decoder_num_cross_layers: 3
+  entropy_model_path: ~/models/entropy_model/best.pt
+  entropy_threshold: 1.335
+  max_patch_size: 0
 
 checkpointer:
   _component_: torchtune.training.FullModelMetaCheckpointer
   #checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt_test/full_single_device/epoch_3
   #checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt/full_single_device/epoch_25  
-  checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt_val/full_single_device/epoch_0
+  checkpoint_dir: /home/ianbarber/models/ttblt_v2_entropy/full_single_device/epoch_2
   #checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt/full_single_device/epoch_0                                                 
   #checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt/full_single_device/epoch_3
   checkpoint_files: [
@@ -43,7 +50,7 @@ tokenizer:
 # Generation arguments; defaults taken from gpt-fast
 prompt:
   user: "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nTell me about cats\n\n### Response:\n\n"
-max_new_tokens: 20
+max_new_tokens: 500
 temperature: 0.7
 top_k: 50 # Smaller, bytes! 
 
