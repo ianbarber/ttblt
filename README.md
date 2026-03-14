@@ -18,7 +18,6 @@ Instead of traditional tokenization, the model operates on raw UTF-8 bytes:
 * **Global model** — Qwen 2.5 3B processes patch embeddings through its standard self-attention layers (no modifications to Qwen's architecture)
 * **Local decoder** — 9 self-attention + 3 interleaved cross-attention layers, predicts bytes from patch representations using a shifted mask (bytes in patch p attend to patch p-1 to prevent information leak)
 
-The full model fits in 24GB VRAM (DGX Spark GB10) with activation checkpointing.
 
 ## Training
 
